@@ -18,6 +18,7 @@ tab-size = 4
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -175,15 +176,6 @@ namespace Cpu {
 
 namespace Gpu {
 	vector<gpu_info> gpus;
-	//? Read a sysfs node containing a single integer; return fallback on missing/parse error.
-	//? Shared by the AMD sysfs (Asysfs) and Intel NPU (IntelNPU) backends.
-	static long long read_ll(const std::filesystem::path& path, long long fallback = 0) {
-		try {
-			return std::stoll(readfile(path, std::to_string(fallback)));
-		} catch (const std::exception&) {
-			return fallback;
-		}
-	}
 	//? NVIDIA data collection
 	namespace Nvml {
 		//? NVML defines, structs & typedefs
@@ -335,6 +327,15 @@ namespace Gpu {
 			std::filesystem::path busy;   //? npu_busy_time_us  (monotonic µs counter)
 			std::filesystem::path freq;   //? npu_current_frequency_mhz
 			std::filesystem::path mem;    //? npu_memory_utilization (bytes)
+			string pci_address;
+			long long initial_busy;
+			bool has_freq;
+			bool has_mem;
+		};
+
+		struct busy_sample {
+			long long value;
+			std::chrono::steady_clock::time_point time;
 		};
 
 		bool initialized = false;
@@ -343,7 +344,7 @@ namespace Gpu {
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
 		uint32_t device_count = 0;
 		vector<npu_paths> devices;
-		vector<long long> busy_prev; //? last npu_busy_time_us per device, same index as devices
+		vector<busy_sample> busy_prev; //? last counter/time sample per device, same index as devices
 	}
 }
 
@@ -2056,6 +2057,15 @@ namespace Gpu {
 	}
 
 	namespace Asysfs {
+		//? Read a sysfs node containing a single integer; return fallback on missing/parse error.
+		static long long read_ll(const std::filesystem::path& path, long long fallback = 0) {
+			try {
+				return std::stoll(readfile(path, std::to_string(fallback)));
+			} catch (const std::exception&) {
+				return fallback;
+			}
+		}
+
 		//? Match /sys/class/drm/cardN (no '-', all digits after "card"). Skips card1-DP-1, renderD*, etc.
 		static bool is_card_node(const string& fname) {
 			if (not fname.starts_with("card") or fname.size() <= 4) return false;
@@ -2233,6 +2243,16 @@ namespace Gpu {
 
 	//? Intel NPU (VPU) data collection — Meteor Lake / Lunar Lake accelerators.
 	namespace IntelNPU {
+		//? Unlike the generic sysfs helper, distinguish a real zero from a failed read.
+		//? A device can disappear after discovery, and treating that failure as a counter
+		//? reset would create a false spike if it returns.
+		static std::optional<long long> read_metric(const std::filesystem::path& path) {
+			std::ifstream file(path);
+			long long value;
+			if (file >> value) return value;
+			return std::nullopt;
+		}
+
 		//? Find candidate NPU devices by scanning the intel_vpu driver sysfs directory.
 		//? Each device is a subdirectory named <domain>:<bus>:<dev>.<fn>, and exposes
 		//? npu_busy_time_us / npu_current_frequency_mhz / npu_memory_utilization.
@@ -2255,14 +2275,23 @@ namespace Gpu {
 				if (name.find(':') == string::npos) continue; //? only PCI BDF dirs contain ':'
 
 				const auto busy_file = entry.path() / "npu_busy_time_us";
-				if (not std::filesystem::exists(busy_file)) continue;
+				const auto busy = read_metric(busy_file);
+				if (not busy) continue;
 
 				npu_paths d{};
 				d.busy = busy_file;
 				d.freq = entry.path() / "npu_current_frequency_mhz";
 				d.mem  = entry.path() / "npu_memory_utilization";
+				d.pci_address = name;
+				d.initial_busy = *busy;
+				d.has_freq = read_metric(d.freq).has_value();
+				d.has_mem = read_metric(d.mem).has_value();
 				devices.push_back(std::move(d));
 			}
+			std::ranges::sort(devices, {}, &npu_paths::pci_address);
+			busy_prev.reserve(devices.size());
+			for (const auto& device : devices)
+				busy_prev.push_back({device.initial_busy, std::chrono::steady_clock::now()});
 
 			device_count = (uint32_t)devices.size();
 			if (device_count == 0) {
@@ -2273,13 +2302,9 @@ namespace Gpu {
 			gpus.resize(gpus.size() + device_count);
 			gpu_names.resize(Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count + device_count);
 			for (uint32_t i = 0; i < device_count; ++i) {
-				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count + i] = "NPU: Intel";
+				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count + i] =
+					fmt::format("NPU: Intel ({})", devices[i].pci_address);
 			}
-
-			//? Baseline: read the busy counter once so first sample doesn't show a spike.
-			busy_prev.reserve(device_count);
-			for (auto& d : devices)
-				busy_prev.push_back(read_ll(d.busy));
 
 			initialized = true;
 			Logger::info("Using intel_vpu sysfs for {} Intel NPU device(s)", device_count);
@@ -2307,34 +2332,41 @@ namespace Gpu {
 					gpu.supported_functions = {
 						.gpu_utilization = true,
 						.mem_utilization = false,
-						.gpu_clock = true,
+						.gpu_clock = d.has_freq,
 						.mem_clock = false,
 						.pwr_usage = false,
 						.pwr_state = false,
 						.temp_info = false,
 						.mem_total = false, //? driver exposes used bytes only, no total
-						.mem_used = true,
+						.mem_used = d.has_mem,
 						.pcie_txrx = false,
 						.encoder_utilization = false,
 						.decoder_utilization = false
 					};
 				}
 
-				//? Utilization: busy_time_us is a monotonic counter — compute per-second rate.
-				long long now = read_ll(d.busy);
-				long long prev = busy_prev[i];
-				busy_prev[i] = now;
-				long long delta = now - prev;
-				//? Guard against counter wrap (driver reload) or a huge gap after system
-				//? suspend, which would otherwise show a spurious 100% spike.
-				long long util = (delta < 0 or delta > 10'000'000) ? 0 : delta / 10'000LL; //? µs/s → %
+				//? Utilization: compare the monotonic busy counter with actual monotonic
+				//? wall time. btop's update interval is configurable and may change live.
+				long long util = 0;
+				const auto sample_time = std::chrono::steady_clock::now();
+				if (const auto busy = read_metric(d.busy)) {
+					if constexpr (not is_init) {
+						const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(sample_time - busy_prev[i].time).count();
+						const auto delta = *busy - busy_prev[i].value;
+						if (elapsed > 0 and delta >= 0)
+							util = std::llround((double)delta * 100.0 / (double)elapsed);
+					}
+					busy_prev[i] = {*busy, sample_time};
+				}
 				gpu.gpu_percent.at("gpu-totals").push_back(std::clamp(util, 0LL, 100LL));
 
 				//? Clock
-				gpu.gpu_clock_speed = (unsigned int)read_ll(d.freq);
+				if (d.has_freq)
+					gpu.gpu_clock_speed = (unsigned int)std::max(read_metric(d.freq).value_or(0), 0LL);
 
 				//? Memory
-				gpu.mem_used = read_ll(d.mem);
+				if (d.has_mem)
+					gpu.mem_used = std::max(read_metric(d.mem).value_or(0), 0LL);
 			}
 			return true;
 		}
