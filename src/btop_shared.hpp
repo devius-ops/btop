@@ -150,6 +150,7 @@ namespace Gpu {
 
 	//* Per-device container for GPU info
 	struct gpu_info {
+		string device_type = "GPU";
 		std::unordered_map<string, deque<long long>> gpu_percent = {
 			{"gpu-totals", {}},
 			{"gpu-vram-totals", {}},
