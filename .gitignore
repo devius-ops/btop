@@ -49,8 +49,9 @@ stage/
 # Compiled man page
 btop.1
 
-build
-bin
+# Local build and executable output
+/build/
+/bin/
 btop
 /obj/
 config.h
