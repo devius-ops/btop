@@ -2184,7 +2184,6 @@ namespace Gpu {
 				const device_paths& d = devices[i];
 
 				if constexpr (is_init) {
-					gpu.device_type = "NPU";
 					gpu.supported_functions = {
 						.gpu_utilization = d.has_busy,
 						.mem_utilization = false,
@@ -2330,6 +2329,7 @@ namespace Gpu {
 				const npu_paths& d = devices[i];
 
 				if constexpr (is_init) {
+					gpu.device_type = "NPU";
 					gpu.supported_functions = {
 						.gpu_utilization = true,
 						.mem_utilization = false,
